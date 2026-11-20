@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "timeoutMs": 15000,
+  "providers": [
+    {
+      "id": "deepseek",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "model": "deepseek-flash",
+      "apiKey": "from-zcode:deepseek",
+      "maxTokens": 500
+    }
+  ]
+}

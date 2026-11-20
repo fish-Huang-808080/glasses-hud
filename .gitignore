@@ -1,0 +1,9 @@
+# 密钥与本地状态，绝不入库
+.state/
+*.token
+*.log
+
+# 55MB 二进制，不入库（README 里给下载地址）
+tools/cloudflared.exe
+
+node_modules/
