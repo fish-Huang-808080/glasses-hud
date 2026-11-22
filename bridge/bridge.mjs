@@ -379,17 +379,17 @@ async function answerFor(messages, snap, source, reqTools) {
   q = q.replace(/[。！？.!?，,\s]+$/g, '').trim(); // ASR 常带句号，去掉再做指令匹配
   console.log(`[${new Date().toTimeString().slice(0, 8)}][q] ${q.slice(0, 60)}`); // 调试：App 发来的原文（本地日志）
 
-  // HUD 模式显式开关（默认关闭）：说"打开提词器"启动，镜腿退出/说"关闭提词器"停止
+  // HUD 模式显式开关（默认关闭）：主口令"跟随电脑"；"提词器"保留兼容
   const HUD_MODE = resolve(here, '../.state/hud-mode');
   const hudOn = () => { try { return readFileSync(HUD_MODE, 'utf8').trim() === 'on'; } catch { return false; } };
   const setHud = (on) => { try { writeFileSync(HUD_MODE, on ? 'on' : 'off'); } catch {} };
-  if (/^(打开|启动|开启|开始)(提词器|监视|看板)$|^提词器$/.test(q)) {
+  if (/^(跟随电脑|跟随电脑状态|电脑跟随|打开提词器|启动看板|提词器)$/.test(q)) {
     setHud(true); console.log('[hud] mode ON (voice)');
-    return ['提词器已启动', '进度看板将常驻镜片', '镜腿退出即可恢复其他功能'];
+    return ['已跟随电脑', '进度看板将常驻镜片', '镜腿退出即可恢复其他功能'];
   }
-  if (/^(关闭|停止|退出)(提词器|监视|看板)$/.test(q)) {
+  if (/^(停止跟随电脑|退出跟随电脑|关闭跟随电脑|关闭提词器|停止提词器|退出提词器)$/.test(q)) {
     setHud(false); console.log('[hud] mode OFF (voice)');
-    return ['提词器已关闭', '眼镜恢复正常功能'];
+    return ['已停止跟随电脑', '眼镜恢复正常功能'];
   }
 
   // 跟随直播（含断连自动重连）：App 层任何新语音都会掐断旧流——所以跟随中的
