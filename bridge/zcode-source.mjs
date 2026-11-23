@@ -167,38 +167,6 @@ export class ZCodeSource extends EventEmitter {
     } catch { return ''; }
   }
 
-  // 跟随直播：取会话中 time_created > since 的新增 part（用户消息/AI文本/工具调用）
-  // 注：part.sequence 是消息内序号(0-N循环)、id 是 UUID——都不能做水位，必须用 time_created
-  streamUpdates(sessionId, sinceTs) {
-    try {
-      const rows = this.open().prepare(
-        `SELECT p.data AS pdata, p.time_created AS ts, json_extract(m.data,'$.role') AS role
-         FROM part p JOIN message m ON p.message_id = m.id
-         WHERE p.session_id = ? AND p.time_created > ? ORDER BY p.time_created LIMIT 30`).all(sessionId, sinceTs);
-      const out = [];
-      for (const r of rows) {
-        let d; try { d = JSON.parse(r.pdata); } catch { continue; }
-        if (d.type === 'text' && d.text) {
-          const t = String(d.text);
-          if (/^<total_tokens|^<system-reminder|tokens left<\/total_tokens/.test(t.trim())) continue; // 系统内部标记不上镜
-          out.push({ ts: r.ts, role: r.role, kind: 'text', text: t });
-        }
-        else if (d.type === 'tool' && d.tool) out.push({ ts: r.ts, role: r.role, kind: 'tool', text: String(d.tool) });
-      }
-      return out;
-    } catch { return []; }
-  }
-
-  currentMaxSeq(sessionId) {
-    try { return this.open().prepare('SELECT COALESCE(MAX(time_created),0) AS m FROM part WHERE session_id = ?').get(sessionId).m; }
-    catch { return 0; }
-  }
-
-  isSessionAlive(sessionId) {
-    try { return !!this.open().prepare('SELECT 1 FROM session_runtime_presence WHERE session_id = ?').get(sessionId); }
-    catch { return false; }
-  }
-
   // 完整 todo 清单（按 position；用于眼镜进度板）
   todosOf(sessionId, limit = 8) {
     try {

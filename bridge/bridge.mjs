@@ -23,17 +23,7 @@ import { tinySearch, hasTinyfish } from './tinyfish.mjs';
 // 语音写操作的中间态（两步确认：预览 → "确认"/"算了"），60 秒有效
 let pendingWrite = null;
 let lastTasks = []; // 最近一次"我的待办"展示的清单（供"完成第N个"定位）
-let lastListOrder = []; // 最近一次"项目列表"的会话顺序（供"跟随第N个"定位，避免排序漂移）
-
-// 自动跟随配置：.state/follow.json {"auto":true} —— 选中自有模型后首句直接进投屏
-function loadAutoFollow() {
-  try { return !!JSON.parse(readFileSync(resolve(here, '../.state/follow.json'), 'utf8')).auto; } catch { return false; }
-}
-
-// 跟随直播模式（认真工作模式）状态
-let followActive = false;    // 当前是否有活跃直播流
-let followStop = false;
-let followState = null;      // { sessionId, title, seq, expiresAt } — 断连后保留 5 分钟供自动重连
+let lastListOrder = []; // 最近一次"项目列表"的会话顺序（供"第N个"定位，避免排序漂移）
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -69,6 +59,7 @@ function loadNotifyKinds() {
 const NOTIFY_KINDS = loadNotifyKinds();
 const WEATHER_FILE = resolve(here, '../.state/weather.json');
 let WeatherCache = (() => { try { const j = JSON.parse(readFileSync(WEATHER_FILE, 'utf8')); return { at: j.at || 0, text: j.text || '' }; } catch { return { at: 0, text: '' }; } })(); // 气温缓存（落盘，重启不丢）
+let meetingSoon = ''; // T-30 会议提醒行（由定时器刷新，/v1/hud 附带显示）
 const DS_FILE = resolve(here, '../.state/ds-balance.json');
 let DsCache = (() => { try { const j = JSON.parse(readFileSync(DS_FILE, 'utf8')); return { at: j.at || 0, text: j.text || '' }; } catch { return { at: 0, text: '' }; } })();
 async function getDsBalance() {
@@ -102,10 +93,6 @@ source.on('event', (e) => {
   if (NOTIFY_KINDS[e.kind]) {
     const tag = { needs_attention: '等待确认', turn_done: '任务完成', turn_ended: '任务中止', tool_failed: '工具失败' }[e.kind] || e.kind;
     feishuWrites.notify(`【ZCode·${tag}】${e.title}。${e.content}`); // 模式B：飞书推送
-  }
-  // 事件行回显到眼镜监视屏（任何会话的"等你确认"都要冒出来）
-  if (e.kind === 'needs_attention' && followState && followState.push) {
-    followState.push(`! 等待确认：${String(e.content || e.title).slice(0, 16)}`);
   }
 });
 
@@ -323,52 +310,6 @@ function sessionCard(s) {
   return lines;
 }
 
-// 眼镜监视器用的"任务进度卡"：只看子任务拆分与完成度，不暴露对话/工具流水
-// compact=true：3 行精简版（说话把卡顶掉后，重连即时补一张，最少占屏）
-function buildProgressCard(source, sid, compact = false) {
-  const snap = source.snapshot();
-  const s = snap.sessions.find(x => x.id === sid);
-  if (!s) return null;
-  const todos = source.todosOf(sid, 8);
-  const total = todos.length;
-  const done = todos.filter(t => t.status === 'completed').length;
-  const attn = s.status === '等待输入' ? '! ' : '';
-  const head = `${attn}【${s.title.slice(0, 12)}】${s.status}${s.running && s.activeSince ? ' · ' + fmtDur(now() - s.activeSince) : ''} · ${fmtClock(now())}${total ? ` · 待办 ${done}/${total}` : ''}`;
-  const lines = [head];
-  if (compact) {
-    if (total) {
-      const cells = 10, filled = Math.max(0, Math.min(cells, Math.round(cells * done / total)));
-      lines.push(`进度 ${'█'.repeat(filled)}${'░'.repeat(cells - filled)} ${done}/${total}`);
-      const cur = todos.find(t => t.status === 'in_progress') || todos.find(t => t.status !== 'completed');
-      if (cur) lines.push(`▶ ${cur.content}`);
-    } else if (s.running) {
-      lines.push(`进行中${s.currentTool ? ' · ' + s.currentTool : ''}`);
-    }
-    return { lines: lines.slice(0, 3), sig: null, compact: true };
-  }
-  if (total) {
-    const cells = 10, filled = Math.max(0, Math.min(cells, Math.round(cells * done / total)));
-    lines.push(`进度 ${'█'.repeat(filled)}${'░'.repeat(cells - filled)} ${done}/${total}`);
-    for (const t of todos.slice(0, 6)) {
-      const mark = t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '▶' : '·';
-      lines.push(`${mark} ${t.content}`);
-    }
-    if (total > 6) lines.push(`…另 ${total - 6} 项`);
-    if (s.status === '等待输入') lines.push('! 等待你确认');
-  } else if (s.running) {
-    lines.push(`进行中${s.currentTool ? ' · ' + s.currentTool : ''}`);
-  } else if (s.lastTurn?.completedAt) {
-    lines.push(`上次完成 ${fmtClock(s.lastTurn.completedAt)} · ${fmtDur(s.lastTurn.durationMs || 0)}`);
-  }
-  // 回合结束：补一行"这次做完了什么"（答案首行，摘要级）
-  if (s.lastTurn?.completedAt && now() - s.lastTurn.completedAt < 10 * 60_000) {
-    const ans = cleanForGlasses(source.latestAssistantText(sid)).split('\n').find(x => x.trim());
-    if (ans) lines.push(`✓ ${ans.slice(0, 26)}`);
-  }
-  const sig = [s.status, s.lastTurn?.id || '', todos.map(t => (t.status[0] || '') + t.content).join('|')].join('#');
-  return { lines: lines.slice(0, 9), sig };
-}
-
 // 眼镜上别显示 markdown 噪音
 const cleanForGlasses = (t) => t.replace(/```[\s\S]*?```/g, m => m.replace(/```/g, '')).replace(/[*#`>|]/g, '').replace(/\n{3,}/g, '\n\n').trim();
 const tailText = (t, max = 230) => (t.length <= max ? t : '…' + t.slice(-max));
@@ -394,23 +335,6 @@ async function answerFor(messages, snap, source, reqTools) {
     return ['已停止跟随电脑', '眼镜恢复正常功能'];
   }
 
-  // 跟随直播（含断连自动重连）：App 层任何新语音都会掐断旧流——所以跟随中的
-  // 任何输入不再是空响应，而是重连直播（水位续播）。
-  // 停止 = "停/停吧/停下/停止跟随/退出跟随/别跟了"；"跟随X"=切换项目（不续播）。
-  const STOP_RE = /^(停|停吧|停下|停一停|停止|停止跟随|退出|退出跟随|别跟了|结束)$/;
-  const SWITCH_RE = /跟随|直播|投屏|认真工作/;
-  if (followState && followState.expiresAt <= now()) followState = null; // 过期清理
-  if (followState && !SWITCH_RE.test(q)) {
-    if (STOP_RE.test(q) || /停止跟随|退出跟随|别跟了/.test(q)) {
-      followStop = true;
-      followState = null;
-      return ['已停止跟随，交互恢复'];
-    }
-    return { __resumeFollow: true };
-  }
-
-  // 调试：检测文本页是否支持 \r 回车覆盖（决定能否做原地刷新的仪表盘）
-  if (/^测试覆盖$|^覆盖测试$/.test(q)) return { __testRefresh: true };
   // 在吗 / 自我介绍
   if (!q || /^(在吗|在不在|你是谁|叫什么|你好|hi|hello|嗨)$/i.test(q)) {
     const running = snap.sessions.filter(s => s.running).length;
@@ -420,37 +344,23 @@ async function answerFor(messages, snap, source, reqTools) {
   if (/^(帮助|你能干什么|能干啥|会什么|怎么用|指令|用法|help)$/i.test(q)) {
     return ['我能做的：', '电脑的项目 — 看所有会话', '第N个 — 进入某个项目', '最新回复 — 它刚说了什么', '今天/明天/本周日程', '我的待办（飞书）', '会话待办 / 事件 / token', '其他问题直接问，我用AI答'];
   }
-  // ===== 跟随直播（认真工作模式）：把会话内容逐条推到眼镜 =====
-  if (/停止跟随|退出跟随|别跟了/.test(q)) {
-    if (!followActive) return ['当前没有在跟随'];
-    followStop = true;
-    return ['正在停止跟随…'];
-  }
-  if (/跟随|直播|投屏|认真工作/.test(q)) {
+  // 选择要监视的项目（只选中，不再有直播流）
+  if (/跟随|监视|看板/.test(q) && !/跟随电脑|电脑跟随/.test(q)) {
     let s = null;
-    // 序号：第N个 / 第N / N号 / 跟随2；优先按最近一次"项目列表"的顺序（避免顺序漂移）
     const nm = q.match(/第\s*([0-9一二三四五六七八九十]+)\s*个?/) || q.match(/([0-9一二三四五六七八九十]+)\s*号/);
     const order = (lastListOrder.length ? lastListOrder : snap.sessions.map(x => x.id));
     if (/当前|这个|刚才/.test(q)) s = snap.sessions.find(x => x.id === selectedSessionId) || snap.sessions[0];
-    else if (nm) {
-      const n = CN_NUM[nm[1]] || parseInt(nm[1]);
-      const id = order[n - 1];
-      s = snap.sessions.find(x => x.id === id);
-    }
-    else if (nm) s = snap.sessions[(CN_NUM[nm[1]] || parseInt(nm[1])) - 1];
+    else if (nm) { const n = CN_NUM[nm[1]] || parseInt(nm[1]); s = snap.sessions.find(x => x.id === order[n - 1]); }
     else {
-      // 关键词：去标点/语气词后模糊匹配（ASR 常带"。"和"项目/迭代"等词）
-      const kw = q.replace(/跟随|直播|投屏|认真工作|模式|项目|会话|任务|那个|这个|[，。！？、\s]/g, '').trim();
+      const kw = q.replace(/跟随|监视|看板|直播|投屏|模式|项目|会话|任务|那个|这个|[，。！？、\s]/g, '').trim();
       if (kw.length >= 2) {
         s = snap.sessions.find(x => x.title.replace(/\s/g, '').includes(kw))
-          || snap.sessions.find(x => kw.includes(x.title.replace(/\s/g, '').slice(0, 6)))
           || snap.sessions.find(x => x.workspace.includes(kw));
       }
     }
-    if (!s) s = snap.sessions[0];
-    if (!s) return ['没有可跟随的项目'];
+    if (!s) return ['没有匹配的项目', '说"项目列表"查看'];
     selectedSessionId = s.id;
-    return { __follow: s.id, title: s.title.slice(0, 16) };
+    return [`已选中：${s.title.slice(0, 14)}`, '说"跟随电脑"让看板显示它'];
   }
   // 任务列表（项目=会话；"在做哪个项目"也算）
   if (/项目列表|电脑.{0,6}项目|在做哪|哪个项目|哪些项目|有什么项目|什么项目|任务列表|会话列表|有哪些任务|列个项目|列个任务/.test(q)) {
@@ -574,13 +484,6 @@ async function answerFor(messages, snap, source, reqTools) {
     const total = snap.sessions.reduce((a, s) => a + (s.tokens24h || 0), 0);
     return [`24h tokens ${fmtTok(total)}`, ...snap.sessions.slice(0, 4).map(s => `${s.title.slice(0, 14)} ${fmtTok(s.tokens24h || 0)}`)];
   }
-  // 自动跟随（外出主模式）：以上的具体指令都不命中时，任何话直接进投屏
-  if (loadAutoFollow()) {
-    const s = snap.sessions.find(x => x.id === selectedSessionId) || snap.sessions[0];
-    if (!s) return ['电脑上没有活跃项目'];
-    selectedSessionId = s.id;
-    return { __follow: s.id, title: s.title.slice(0, 16), auto: true };
-  }
   // “电脑”域兜底：提到电脑但未命中具体意图 → 状态总览（本地即时，省 LLM 一跳）
   if (/电脑/.test(q)) return digestState(snap);
   // 工具透传：手机带了本地功能 tools 且 HUD 未命中 → DeepSeek 决定（模型选工具，手机执行）
@@ -702,6 +605,7 @@ const server = createServer(async (req, res) => {
         else if (failEv) attention = `✗ ${cut(String(failEv.title).replace('工具失败 ·', ''), 12)}`;
         else if (doneEv) attention = `✓ ${cut(String(doneEv.title), 14)}`;
         if (attention) lines.push(attention);
+        if (meetingSoon) lines.push(meetingSoon);
       }
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(lines.slice(0, 6).join('\n'));
@@ -802,100 +706,6 @@ const server = createServer(async (req, res) => {
         }
         lines = digestState(source.snapshot()); // 上游不可用 → 退化本地总览
       }
-      // 覆盖能力探测：A → \rB → \rC，看镜片是"三行各一"还是"只显示C"
-      if (lines && !Array.isArray(lines) && lines.__testRefresh) {
-        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
-        const w = (s) => { try { res.write(`data: ${JSON.stringify(chunkOf({ content: s }))}\n\n`); } catch {} };
-        w('覆盖测试A\n'); await new Promise(r => setTimeout(r, 1500));
-        w('\r覆盖测试B'); await new Promise(r => setTimeout(r, 1500));
-        w('\r覆盖测试C\n'); await new Promise(r => setTimeout(r, 1000));
-        res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: 'zcode-hud', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`);
-        res.write('data: [DONE]\n\n'); res.end();
-        return;
-      }
-      const followReq = lines && !Array.isArray(lines) && (lines.__follow || lines.__resumeFollow);
-      if (followReq) {
-        const resume = !!lines.__resumeFollow;
-        const sid = lines.__follow || followState?.sessionId;
-        const title = resume ? (followState?.title || '会话') : lines.title;
-        if (!sid) return json(200, { id, object: 'chat.completion', created, model: 'zcode-hud', choices: [{ index: 0, message: { role: 'assistant', content: '没有可跟随的项目' }, finish_reason: 'stop' }] });
-        if (!parsed.stream) { console.log(`[${new Date().toTimeString().slice(0, 8)}][follow] NON-STREAM request (App sent stream=false)`); return json(200, { id, object: 'chat.completion', created, model: 'zcode-hud', choices: [{ index: 0, message: { role: 'assistant', content: '跟随模式需流式请求（App 默认开启）' }, finish_reason: 'stop' }] }); }
-        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
-        const send = (txt) => { try { res.write(`data: ${JSON.stringify(chunkOf({ content: String(txt) + '\n' }))}\n\n`); } catch {} };
-        const ping = () => { try { res.write(`data: ${JSON.stringify(chunkOf({ content: '\u200b' }))}\n\n`); } catch {} }; // 零宽空格心跳：不可见、不换行、不清屏
-        const MAX_FOLLOW_MS = 4 * 60 * 60_000; // 安全上限 4 小时（原 30 分钟太短）
-        // 续播不显示任何标记；新开只给操作提示（进度卡随后由快照推送）
-        if (!resume) {
-          send('【监视】说"停"退出，"跟随第N个"切换');
-          const list = source.snapshot().sessions.slice(0, 3).map((s, i) => `${i + 1}.${s.title.slice(0, 10)}`).join('  ');
-          if (lines.auto && list) send(list);
-        }
-        followActive = true; followStop = false;
-        console.log(`[${new Date().toTimeString().slice(0, 8)}][follow] ${resume ? 'resume' : 'start'} ${sid.slice(-6)} stream=${!!parsed.stream}`);
-        // 事件行通道：外部事件（会议临期/等你确认）可实时贴一行到当前监视屏
-        if (!followState) followState = { sessionId: sid, title, sig: '', lastAt: 0, lastCardAt: 0, missingSince: 0, todoState: {}, expiresAt: now() + 30 * 60_000 };
-        followState.push = (txt) => { try { res.write(`data: ${JSON.stringify(chunkOf({ content: String(txt) + '\n' }))}\n\n`); lastSend = Date.now(); } catch {} };
-        let lastSend = Date.now();
-        const startedAt = Date.now();
-        const finish = (why) => {
-          clearInterval(timer);
-          followActive = false;
-          if (followState) followState.push = null;
-          followState = null; // 正常终点（停止/超时/会话死）：清除直播会话
-          console.log(`[${new Date().toTimeString().slice(0, 8)}][follow] end: ${why}`);
-          try { send(why); res.write(`data: ${JSON.stringify({ id, object: 'chat.completion.chunk', created, model: 'zcode-hud', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\n`); res.write('data: [DONE]\n\n'); res.end(); } catch {}
-        };
-        // 监视器模式：只在"任务进度有变化"时推一张进度卡，不推对话流水/工具调用
-        // 断流重连（通常是用户说话/环境音把页面顶掉）：立刻补一张 3 行精简卡（5 秒内不重复）
-        let forceCard = resume && Date.now() - (followState?.lastCardAt || 0) > 5_000;
-        const timer = setInterval(() => {
-          try {
-            if (followStop) return finish('已停止跟随');
-            if (Date.now() - startedAt > MAX_FOLLOW_MS) return finish('跟随已满4小时，自动退出');
-            // 会话消失给 5 分钟宽限（presence 可能抖动；避免误判退出）
-            if (!source.isSessionAlive(followState.sessionId)) {
-              if (!followState.missingSince) followState.missingSince = Date.now();
-              if (Date.now() - followState.missingSince > 5 * 60_000) return finish('会话已结束，跟随退出');
-            } else followState.missingSince = 0;
-            followState.expiresAt = now() + 30 * 60_000; // 活跃续期（断连后可续播30分钟）
-            const card = buildProgressCard(source, followState.sessionId);
-            if (!card) return;
-            // 签名 = 状态+todo状态集+回合；变化才推（不周期性换行，避免滚屏）
-            if (forceCard && card) {
-              forceCard = false;
-              followState.lastCardAt = Date.now();
-              const mini = buildProgressCard(source, followState.sessionId, true);
-              if (mini) for (const ln of mini.lines) send(ln);
-              lastSend = Date.now();
-              console.log(`[${new Date().toTimeString().slice(0, 8)}][follow] compact card on resume`);
-            }
-            if (card.sig !== followState.sig) {
-              forceCard = false;
-              followState.sig = card.sig;
-              followState.lastAt = Date.now();
-              followState.lastCardAt = Date.now();
-              if (followState.shown) send('———'); // 快照分隔
-              for (const ln of card.lines) send(ln);
-              console.log(`[${new Date().toTimeString().slice(0, 8)}][follow] card pushed (${card.lines.length} lines)`);
-              followState.shown = true;
-              lastSend = Date.now();
-            }
-            // App 有30秒无可见内容即掐断的机制（实测：正好30s），零宽心跳不被认。
-            // 每25秒推一行"行情条"保住页面：时间+进度+当前子任务（≤24字，慢速滚动，不空白）
-            if (Date.now() - lastSend > 25_000) {
-              const tt = source.todosOf(followState.sessionId, 8);
-              const dd = tt.filter(x => x.status === 'completed').length;
-              const cur = tt.find(x => x.status === 'in_progress') || tt.find(x => x.status !== 'completed');
-              send(`⏱${fmtClock(now())} ${dd}/${tt.length}${cur ? ' ▶' + cur.content.slice(0, 10) : ''}`);
-              console.log(`[${new Date().toTimeString().slice(0, 8)}][follow] tick sent`);
-              lastSend = Date.now();
-            }
-          } catch {}
-        }, 2000);
-        // 被打断（App 发起新请求导致 close）：不清 followState —— 新请求会自动重连续播（5 分钟窗口）
-        res.on('close', () => { clearInterval(timer); followActive = false; if (followState) followState.push = null; console.log(`[${new Date().toTimeString().slice(0, 8)}][follow] client closed after ${Math.round((Date.now() - startedAt) / 1000)}s (state kept)`); });
-        return;
-      }
       if (parsed.stream) {
         res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
         for (const line of lines) {
@@ -927,15 +737,15 @@ server.listen(port, host, () => {
       const evs = await feishu.agendaToday();
       if (!Array.isArray(evs)) return;
       const nowMs = now();
+      meetingSoon = '';
       for (const e of evs) {
         if (e.allDay || !e.id) continue;
         const mins = (new Date(e.startIso).getTime() - nowMs) / 60000;
-        // 眼镜事件行：T-30 分钟（25~35 窗口，只一次）
-        if (mins > 25 && mins <= 35 && !reminded30.has(e.id)) {
-          reminded30.add(e.id);
-          const line = `⚡ ${e.time} ${e.summary.slice(0, 12)} · ${Math.round(mins)}分后`;
-          if (followState && followState.push) followState.push(line);
-          console.log(`[remind30] ${line}`);
+        // 会议临期：T-30 显示在 HUD 上（25~35 窗口）
+        if (mins > 25 && mins <= 35) {
+          if (!reminded30.has(e.id)) reminded30.add(e.id);
+          meetingSoon = `⚡${e.time} ${e.summary.slice(0, 10)} ${Math.round(mins)}分后`;
+          console.log(`[remind30] ${meetingSoon}`);
         }
         if (mins > 9 && mins <= 20 && !reminded.has(e.id)) {
           reminded.add(e.id);
