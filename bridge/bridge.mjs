@@ -11,7 +11,7 @@
 // Run: node bridge.mjs [--host 127.0.0.1] [--port 8790] [--db <path>] [--token-file <path>]
 
 import { createServer } from 'node:http';
-import { readFileSync, writeFileSync, mkdirSync, existsSync, chmodSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, mkdirSync, existsSync, chmodSync, rmSync } from 'node:fs';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { dirname, resolve } from 'node:path';
 import { homedir } from 'node:os';
@@ -24,8 +24,22 @@ import { tinySearch, hasTinyfish } from './tinyfish.mjs';
 let pendingWrite = null;
 let lastTasks = []; // 最近一次"我的待办"展示的清单（供"完成第N个"定位）
 let lastListOrder = []; // 最近一次"项目列表"的会话顺序（供"第N个"定位，避免排序漂移）
+// 给 bridge 起的称呼：用户喊它时会带上，匹配指令前先去掉。留空 = 不处理称呼。
+const ASSISTANT_NAME = String(process.env.HUD_ASSISTANT_NAME || '').trim();
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+// 眼镜视图状态：镜腿滚轮 / 通知按钮切视图时改这里，/v1/hud 按它渲染
+const VIEWS = ['home', 'agents', 'todos', 'schedule'];
+const VIEW_FILE = resolve(here, '../.state/hud-view');
+let currentView = 'home';
+try { const v = readFileSync(VIEW_FILE, 'utf8').trim(); if (VIEWS.includes(v)) currentView = v; } catch {}
+const setView = (v) => {
+  if (!VIEWS.includes(v)) return null;
+  currentView = v;
+  try { writeFileSync(VIEW_FILE, v); } catch {}
+  return v;
+};
 
 const args = process.argv.slice(2);
 const option = (name, fallback) => { const i = args.indexOf(name); return i >= 0 && args[i + 1] ? args[i + 1] : fallback; };
@@ -96,7 +110,7 @@ source.on('event', (e) => {
   }
 });
 
-// ---------- 小码大脑：LLM 兜底（规则意图未命中时） ----------
+// ---------- LLM 兜底（规则意图未命中时） ----------
 // .state/llm.json 可覆写；apiKey 支持 "from-zcode:<providerId>" 运行时读取 ZCode 配置，不复制密钥。
 function loadLlmConfig() {
   try {
@@ -270,7 +284,7 @@ const CN_NUM = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '�
 
 function digestState(snap) {
   const lines = [];
-  if (!snap.sessions.length) return ['小码：ZCode 没有活跃会话', `检查时间 ${fmtClock(snap.generatedAt)}`];
+  if (!snap.sessions.length) return ['ZCode 没有活跃会话', `检查时间 ${fmtClock(snap.generatedAt)}`];
   const totalTok = snap.sessions.reduce((a, s) => a + (s.tokens24h || 0), 0);
   for (const s of snap.sessions.slice(0, 4)) {
     const mark = s.status === '等待输入' ? '!' : s.running ? '>' : '·';
@@ -316,7 +330,8 @@ const tailText = (t, max = 230) => (t.length <= max ? t : '…' + t.slice(-max))
 
 async function answerFor(messages, snap, source, reqTools) {
   let q = String(messages?.at(-1)?.content || '').trim();
-  q = q.replace(/^小雷[，,。!！?\s]*/, '').replace(/^小码[，,。!！?\s]*/, '').replace(/小码/g, '').trim();
+  // 去掉唤醒词/称呼前缀再做指令匹配（"小雷"是眼镜自带唤醒词；自定义称呼可配）
+  q = q.replace(/^小雷[，,。!！?\s]*/, '').replace(new RegExp('^' + ASSISTANT_NAME + '[，,。!！?\\s]*'), '').replace(new RegExp(ASSISTANT_NAME, 'g'), '').trim();
   q = q.replace(/[。！？.!?，,\s]+$/g, '').trim(); // ASR 常带句号，去掉再做指令匹配
   console.log(`[${new Date().toTimeString().slice(0, 8)}][q] ${q.slice(0, 60)}`); // 调试：App 发来的原文（本地日志）
 
@@ -502,7 +517,7 @@ const server = createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && req.url === '/health') {
       const snap = source.snapshot();
-      return json(200, { ok: true, dbReadable: snap.dbReadable, liveSessions: snap.sessions.length, pollMs: 2000 });
+      return json(200, { ok: true, dbReadable: snap.dbReadable, liveSessions: snap.sessions.length, pollMs: 2000, view: currentView });
     }
     // 本机 hooks 即时事件入口：仅 127.0.0.1，免 token（hooks 无法安全携带；回环限制即鉴权）
     if (req.method === 'POST' && req.url === '/v1/hook') {
@@ -516,6 +531,15 @@ const server = createServer(async (req, res) => {
     if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return json(401, { error: 'unauthorized' });
 
     if (req.method === 'GET' && req.url === '/v1/state') return json(200, source.snapshot());
+
+    // 眼镜侧探针：模块把现场观测（唤醒/镜腿/收到的消息类型）上报到这里，逐行落盘待查
+    if (req.method === 'POST' && req.url === '/v1/probe') {
+      let body = ''; for await (const c of req) { body += c; if (Buffer.byteLength(body) > 8192) return json(413, { error: 'body_too_large' }); }
+      let p; try { p = JSON.parse(body); } catch { return json(400, { error: 'invalid_json' }); }
+      const line = `${new Date().toISOString()} ${String(p.tag || '?').slice(0, 40)} ${String(p.detail || '').slice(0, 600)}\n`;
+      try { appendFileSync(resolve(here, '../.state/probe.log'), line); } catch {}
+      return json(200, { ok: true });
+    }
 
     // 眼镜提词器 HUD：双列拼接（每行≤34半角单位 ≈17汉字），右列放时间/进度
     if (req.method === 'GET' && req.url.startsWith('/v1/hud')) {
@@ -567,8 +591,35 @@ const server = createServer(async (req, res) => {
         return l + ' '.repeat(pad) + r;
       };
       const snap = source.snapshot();
-      const s = snap.sessions.find(x => x.id === selectedSessionId) || snap.sessions[0];
       const lines = [];
+      if (currentView === 'agents') {
+        const ss = snap.sessions;
+        const runningN = ss.filter(x => x.running).length;
+        lines.push(twoCol('Agent 看板', `${runningN}/${ss.length} 运行`, 33));
+        if (!ss.length) lines.push('没有活跃会话');
+        else for (const x of ss.slice(0, 3)) {
+          const st = x.status === '等待输入' ? '!等确认'
+            : (x.running && x.activeSince ? `>${durShort(now() - x.activeSince)}` : '.空闲');
+          lines.push(twoCol(x.title.slice(0, 12), st, 33));
+        }
+      } else if (currentView === 'todos') {
+        let r = null; try { r = await feishu.tasks(); } catch {}
+        const n = r && Number.isFinite(r.total) ? r.total : 0;
+        lines.push(twoCol('待办', n ? `共${n}项` : '无', 33));
+        const mine = (r && r.mine) || [];
+        if (!mine.length) lines.push('没有未完成的待办');
+        else for (const t of mine.slice(0, 3)) {
+          const due = t.due ? String(t.due).split(' ')[0] : '';
+          lines.push(twoCol(t.summary.slice(0, 14), due, 33));
+        }
+      } else if (currentView === 'schedule') {
+        let evs = null; try { evs = await feishu.agendaToday(); } catch {}
+        const up = (evs || []).filter(e => e.allDay || new Date(e.startIso).getTime() >= now() - 5 * 60_000);
+        lines.push(twoCol('今日剩余', up.length ? `${up.length}场` : '无', 33));
+        if (!up.length) lines.push('今天没有剩余日程');
+        else for (const e of up.slice(0, 3)) lines.push(cut(`${e.time} ${e.summary}`, 33));
+      } else {
+      const s = snap.sessions.find(x => x.id === selectedSessionId) || snap.sessions[0];
       if (!s) {
         lines.push(twoCol('ZCode', fmtClock(now())), '没有活跃项目');
       } else {
@@ -607,11 +658,29 @@ const server = createServer(async (req, res) => {
         if (attention) lines.push(attention);
         if (meetingSoon) lines.push(meetingSoon);
       }
+      }
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(lines.slice(0, 6).join('\n'));
     }
 
+    // 眼镜侧（滚轮/通知按钮）切视图：{name: home|agents|todos|schedule}
+    if (req.method === 'POST' && req.url === '/v1/view') {
+      let body = ''; for await (const c of req) { body += c; if (Buffer.byteLength(body) > 8192) return json(413, { error: 'body_too_large' }); }
+      let p; try { p = JSON.parse(body || '{}'); } catch { return json(400, { error: 'invalid_json' }); }
+      const v = setView(String(p.name || '').trim());
+      if (!v) return json(400, { error: 'unknown_view', views: VIEWS });
+      console.log(`[hud] view -> ${v}`);
+      return json(200, { ok: true, view: v });
+    }
+    if (req.method === 'GET' && req.url === '/v1/view') return json(200, { view: currentView });
+
     // App 检测到用户用镜腿退出提词器 → 通知关闭 HUD 模式（恢复正常功能）
+    if (req.method === 'POST' && req.url === '/v1/hud/on') {
+      try { writeFileSync(resolve(here, '../.state/hud-mode'), 'on'); } catch {}
+      console.log('[hud] mode ON (remote)');
+      return json(200, { ok: true });
+    }
+
     if (req.method === 'POST' && req.url === '/v1/hud/off') {
       try { writeFileSync(resolve(here, '../.state/hud-mode'), 'off'); } catch {}
       console.log('[hud] mode OFF (glasses exit)');

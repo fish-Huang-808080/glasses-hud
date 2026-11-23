@@ -25,6 +25,41 @@
 
 ---
 
+## 三个角色，各干各的
+
+> 前提：**电脑是主体，手机是遥控器，眼镜只是监视器。**
+> 眼镜不承担输入、不承担计算，只负责“看”和“切视图”。
+
+| 角色 | 定位 | 负责什么 |
+|---|---|---|
+| **电脑** | 常驻的 Agent 主机 | 长期运行 ZCode；保存全部待办、任务、文件与执行记录；提供 `/v1/*` 数据接口。**唯一有完整控制权的一端。** |
+| **手机** | 远程客户端 + 眼镜的网关 | 在外用 ZCode 的 Remote 客户端做复杂交互；跑雷鸟 AI App，把电脑的数据转发到眼镜，并提供通知栏按钮。 |
+| **眼镜** | 纯监视器 | 实时显示电脑与各 Agent 的状态。输入只有镜腿滚轮，不做文字输入。 |
+
+数据流：
+
+```
+电脑（状态） ──► 手机 App（轮询 /v1/hud） ──► 眼镜（显示）
+眼镜（滚轮）/ 通知栏（按钮） ──► 手机 App ──► 电脑（切视图） ──► 眼镜（换一张）
+```
+
+复杂任务回到手机/电脑；眼镜上不做长文本输入。
+
+### 视图
+
+| 视图 | 内容 | 状态 |
+|---|---|---|
+| 综合看板 | 日期/气温/余额/待办数/当前项目与进度 | 已实现 |
+| AI 进度 | 各 ZCode 会话状态、运行时长、等待确认 | 已实现 |
+| 飞书待办 | 飞书待办清单与数量 | 已实现 |
+| 日历日程 | 今日剩余会议 | 已实现 |
+| 未读 | 飞书有新消息的会话（服务端没有未读计数，只能用本地水位线推断） | 未做 |
+| 服务器 | 自定义健康检查 | 未做 |
+
+切换方式：镜腿滚轮滑一下，或点通知栏。
+
+---
+
 ## 它由两部分组成
 
 ```
@@ -50,10 +85,28 @@
 
 | 能力 | 说明 |
 |---|---|
-| 看板 | 日期/昼夜、气温、DS 余额、飞书待办数、项目名/状态/已跑时长、10 格进度条 |
-| 语音开关 | “跟随电脑”启动看板；镜腿退出即关闭，恢复眼镜原生功能 |
+| 看板 | 四个视图，镜腿滚轮 / 通知栏切换（见下） |
+| 开关 | “跟随电脑”或点通知启动看板；镜腿退出即关闭，恢复眼镜原生功能 |
 | 问答 | 自定义模型接入后可用自然语言问项目状态/待办/日程/妙记/搜索 |
 | 跟随 | 选定项目后，看板持续显示其进度 |
+
+### 四个视图
+
+| 视图 | 内容 |
+|---|---|
+| **综合看板** | 日期/昼夜、气温、DS 余额、飞书待办数、项目名/状态/已跑时长、10 格进度条 |
+| **AI 进度** | 各 ZCode 会话：名称、运行中/等确认/空闲、已跑时长 |
+| **飞书待办** | 飞书未完成清单（前几条）+ 总数 |
+| **日历日程** | 今天剩余会议 |
+
+**眼镜不接收语音指令**——提词器在屏时眼镜固件不打开语音通道（原因见
+[`docs/design-notes.md`](docs/design-notes.md)）。切视图走两个输入：
+
+- **镜腿滚轮**：滑一下切下一张/上一张
+- **通知栏**：点通知本体 = 下一张；展开后 4 个按钮直达某个视图。
+  部分 ROM（如 MIUI）默认把动作按钮折叠，所以“点本体”是保底路径。
+
+两个入口都会顺带把看板模式打开，所以不需要先说口令。
 
 ## 快速开始（bridge）
 
@@ -90,14 +143,18 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/v1/hud
    渠道下载的雷鸟 AI APK 打补丁（其 README 有完整步骤）。
 2. 把 [`hud-module/ZcodeHudBridge.java`](hud-module/ZcodeHudBridge.java) 放进
    `custom_ai_mod/src/com/rayneo/customai/`，按
-   [`hud-module/README.md`](hud-module/README.md) 做 3 处小改动后重新打包。
+   [`hud-module/README.md`](hud-module/README.md) 和
+   [`hud-module/PATCHES.md`](hud-module/PATCHES.md) 逐处改宿主文件后重新打包。
 3. App 的 ⚡LLM 面板里填自定义模型：
    - 地址：`https://<你的主机>/v1`（协议选 **Chat /chat/completions**）
    - Key：`.state/bridge.token`
    - 模型名：任意
-4. 对眼镜说“**跟随电脑**”启动看板；按镜腿退出即关闭。
+4. 对眼镜说“**跟随电脑**”，或点通知栏的「ZCode 看板」启动看板；
+   按镜腿退出即关闭。
 
 ### 语音指令
+
+眼镜的语音只在**看板没开**时可用。看板开着时说话没有反应，这是通道限制。
 
 | 说 | 效果 |
 |---|---|
@@ -105,7 +162,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/v1/hud
 | 停止跟随电脑 | 停止看板（镜腿退出等效） |
 | 项目列表 → 第 N 个 → 跟随电脑 | 切换跟随的项目 |
 | 跟随第 N 个项目 / 打开某项目 | 直接选中项目（说“跟随电脑”后生效） |
-| 我的待办 / 今天日程 / 最近的妙记 | 飞书数据 |
+| 我的待办 / 今天日程 / 最近的妙记 | 飞书数据（以对话形式回答，不上看板） |
 | 家里电脑在干什么 | 项目状态总览 |
 
 ## 版式约定（眼镜提词器通道）
@@ -130,8 +187,9 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/v1/hud
 - 看板内容会经手机 App 与（可选的）LLM 服务处理；LLM 会把状态摘要发给模型供应商。
   不想外发就删掉 `.state/llm.json`。
 - 眼镜**电量**目前读不到（标准 Battery Service 返回空），因此不显示。
-- 提词器与语音互斥：看板开启时语音助手不可用，这是通道本身的限制；所以做成
-  “说提词器才开、退出即关”。
+- 提词器与语音互斥：看板开启时，眼镜的语音助手不可用（固件层面不打开语音
+  通道），所以切视图走滚轮和通知栏。原因和探针数据见
+  [`docs/design-notes.md`](docs/design-notes.md)。
 
 ## License
 
@@ -149,11 +207,17 @@ AGPL-3.0 + Commons Clause，Turbo-IO 为 PolyForm Noncommercial。详见 [LICENS
 ## English (short)
 
 **glasses-hud** turns a pair of **RayNeo iO** glasses into a persistent HUD for your
-coding agent. It relies on the iO's teleprompter channel and the official RayNeo AI
+coding agent. The PC is the host and the only control plane; the phone runs the
+RayNeo AI app, relays data to the glasses and offers notification buttons; the
+glasses are a display-only monitor. It has four views (overview, agent progress,
+Feishu to-dos, today's calendar), switched with the **temple scroll wheel** or the
+**notification buttons** — the glasses do not take voice commands while the HUD is up.
+It relies on the iO's teleprompter channel and the official RayNeo AI
 app protocol, and has only been verified on that hardware. Other glasses (RayNeo X3,
 Air series, other brands) **cannot use it as-is** — their display channels and app
 stacks differ, so the glasses-side module would need to be rebuilt for that device.
 
-Say “提词器” to show the HUD, exit with the temple button to get the glasses back.
-Unofficial project, not affiliated with RayNeo. MIT for our code; no APKs or
-firmware are distributed. See `SECURITY.md` before exposing the bridge.
+Say “跟随电脑” or tap the notification to show the HUD, exit with the temple
+button to get the glasses back. Unofficial project, not affiliated with RayNeo.
+MIT for our code; no APKs or firmware are distributed. See `SECURITY.md` before
+exposing the bridge.
