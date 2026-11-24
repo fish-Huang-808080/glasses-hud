@@ -102,17 +102,15 @@ public final class ZcodeHudBridge {
         switchView(VIEW_RING[next]);
     }
 
-    /** 切到指定视图；网络操作放到 HUD 线程，避免阻塞调用方（BLE 线程 / 广播）。 */
+    /** 通知栏/滚轮共用：切换视图 → 立即推屏。
+     *  用独立线程而不是 post 到 HUD 线程：滚轮从 BLE 线程进来，若 HUD 线程的 handler
+     *  此时不消化消息（实测空闲数分钟后会这样），post 会静默丢掉——表现为
+     *  “有手势、bridge 没收到请求”；点一次通知又会恢复。已用独立线程修复并实测。 */
     public static void switchView(final String name) {
         currentView = name;
-        Handler h = handler;
-        if (h != null) {
-            h.post(new Runnable() {
-                @Override public void run() { doSwitchView(name); }
-            });
-        } else {
-            doSwitchView(name);
-        }
+        new Thread(new Runnable() {
+            @Override public void run() { doSwitchView(name); }
+        }, "zcode-view").start();
     }
 
     private static void doSwitchView(String name) {
