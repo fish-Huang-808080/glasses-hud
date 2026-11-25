@@ -52,15 +52,33 @@ const dbPath = resolve(option('--db', `${homedir()}/.zcode/cli/db/db.sqlite`));
 const host = option('--host', '127.0.0.1');
 const port = Number(option('--port', '8790'));
 const tokenFile = resolve(option('--token-file', `${here}/../.state/bridge.token`));
+const displayTokenFile = resolve(option('--display-token-file', `${here}/../.state/display.token`));
 
-if (!existsSync(tokenFile)) {
-  mkdirSync(dirname(tokenFile), { recursive: true });
-  const t = randomBytes(24).toString('base64url');
-  writeFileSync(tokenFile, t); try { chmodSync(tokenFile, 0o600); } catch {}
-  console.log(`[bridge] generated token file: ${tokenFile} (fill its value into the phone as the model API key)`);
+// 生成一个随机 token 文件（0600），已存在则原样读取
+function ensureToken(file, label) {
+  if (!existsSync(file)) {
+    mkdirSync(dirname(file), { recursive: true });
+    const t = randomBytes(24).toString('base64url');
+    writeFileSync(file, t); try { chmodSync(file, 0o600); } catch {}
+    console.log(`[bridge] generated ${label} token file: ${file}`);
+  }
+  return readFileSync(file, 'utf8').trim();
 }
-const token = readFileSync(tokenFile, 'utf8').trim();
-const expected = Buffer.from('Bearer ' + token);
+
+// 两把钥匙：
+//   full     —— 本机自用（语音问答、创建/完结飞书待办、读会话内容）
+//   display  —— 给手机 App / 眼镜：只能看看板和切换看板，不能触发任何写操作
+const fullToken = ensureToken(tokenFile, 'full');
+const displayToken = ensureToken(displayTokenFile, 'display');
+const bearer = (t) => Buffer.from('Bearer ' + t);
+const expected = bearer(fullToken);          // 完整权限
+const expectedDisplay = bearer(displayToken); // 仅显示
+
+// 手机/眼镜只需要这些接口；其余一律要求完整权限
+const DISPLAY_PATHS = new Set([
+  'GET /v1/hud', 'GET /v1/view', 'POST /v1/view',
+  'POST /v1/hud/on', 'POST /v1/hud/off', 'POST /v1/probe', 'GET /health',
+]);
 
 // 事件→飞书推送策略（终态通知：外出托管时"有结果了就喊"）。.state/notify.json 可覆盖。
 function loadNotifyKinds() {
@@ -73,11 +91,32 @@ function loadNotifyKinds() {
 const NOTIFY_KINDS = loadNotifyKinds();
 const WEATHER_FILE = resolve(here, '../.state/weather.json');
 let WeatherCache = (() => { try { const j = JSON.parse(readFileSync(WEATHER_FILE, 'utf8')); return { at: j.at || 0, text: j.text || '' }; } catch { return { at: 0, text: '' }; } })(); // 气温缓存（落盘，重启不丢）
+let weatherBusy = false;
+async function fetchWeather() {
+  if (weatherBusy) return WeatherCache.text || '';
+  weatherBusy = true;
+  try {
+    const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 4000);
+    const r = await fetch('https://wttr.in/?format=%t', { signal: ctrl.signal, headers: { 'User-Agent': 'curl/8.0' } });
+    clearTimeout(tm);
+    if (r.ok) {
+      const s = (await r.text()).trim().replace(/^\+/, '');
+      if (/^-?\d+°C$/.test(s)) {
+        WeatherCache = { at: Date.now(), text: s };
+        try { writeFileSync(WEATHER_FILE, JSON.stringify(WeatherCache)); } catch {}
+      }
+    }
+  } catch {}
+  finally { weatherBusy = false; }
+  return WeatherCache.text || '';
+}
 let meetingSoon = ''; // T-30 会议提醒行（由定时器刷新，/v1/hud 附带显示）
 const DS_FILE = resolve(here, '../.state/ds-balance.json');
 let DsCache = (() => { try { const j = JSON.parse(readFileSync(DS_FILE, 'utf8')); return { at: j.at || 0, text: j.text || '' }; } catch { return { at: 0, text: '' }; } })();
-async function getDsBalance() {
-  if (DsCache.text && Date.now() - DsCache.at < 10 * 60_000) return DsCache.text;
+let dsRefreshing = false;
+async function refreshDsBalance() {
+  if (dsRefreshing) return DsCache.text || '';
+  dsRefreshing = true;
   try {
     const cfgPath = resolve(homedir(), '.zcode/v2/provider_config.json');
     const cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
@@ -94,11 +133,19 @@ async function getDsBalance() {
         const t = '¥' + Number(b.total_balance).toFixed(2);
         DsCache = { at: Date.now(), text: t };
         try { writeFileSync(DS_FILE, JSON.stringify(DsCache)); } catch {}
-        return t;
       }
     }
   } catch {}
+  finally { dsRefreshing = false; }
   return DsCache.text || '';
+}
+// 看板取值：有缓存就直接给（过期则后台刷新），绝不阻塞请求；只在从没拿到过时才等一次
+async function getDsBalance() {
+  if (DsCache.text) {
+    if (Date.now() - DsCache.at >= 10 * 60_000) refreshDsBalance();
+    return DsCache.text;
+  }
+  return refreshDsBalance();
 }
 
 const source = new ZCodeSource({ dbPath, pollMs: 2000, now });
@@ -527,8 +574,14 @@ const server = createServer(async (req, res) => {
       try { source.pushExternal(JSON.parse(body)); return json(200, { ok: true }); }
       catch { return json(400, { error: 'invalid_json' }); }
     }
+    // 鉴权：两把钥匙。先认完整权限，再判断是否为“仅显示”token 且访问的是显示类接口
     const actual = Buffer.from(req.headers.authorization || '');
-    if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return json(401, { error: 'unauthorized' });
+    const key = `${req.method} ${req.url.split('?')[0]}`;
+    let authLevel = null;
+    if (actual.length === expected.length && timingSafeEqual(actual, expected)) authLevel = 'full';
+    else if (actual.length === expectedDisplay.length && timingSafeEqual(actual, expectedDisplay)) authLevel = 'display';
+    if (!authLevel) return json(401, { error: 'unauthorized' });
+    if (authLevel === 'display' && !DISPLAY_PATHS.has(key)) return json(403, { error: 'display_token_readonly' });
 
     if (req.method === 'GET' && req.url === '/v1/state') return json(200, source.snapshot());
 
@@ -551,23 +604,13 @@ const server = createServer(async (req, res) => {
         const u = new URL(req.url, 'http://127.0.0.1');
         gb = Number(u.searchParams.get('gb')); pb = Number(u.searchParams.get('pb'));
       } catch {}
-      // 天气（IP 定位，10 分钟缓存）
+      // 天气（IP 定位，10 分钟缓存；有过值就不再阻塞请求，过期后台刷新）
       const getWeather = async () => {
-        if (WeatherCache.text && Date.now() - WeatherCache.at < 10 * 60_000) return WeatherCache.text;
-        try {
-          const ctrl = new AbortController(); const tm = setTimeout(() => ctrl.abort(), 4000);
-          const r = await fetch('https://wttr.in/?format=%t', { signal: ctrl.signal, headers: { 'User-Agent': 'curl/8.0' } });
-          clearTimeout(tm);
-          if (r.ok) {
-            let s = (await r.text()).trim().replace(/^\+/, '');
-            if (/^-?\d+°C$/.test(s)) {
-              WeatherCache = { at: Date.now(), text: s };
-              try { writeFileSync(WEATHER_FILE, JSON.stringify(WeatherCache)); } catch {}
-              return s;
-            }
-          }
-        } catch {}
-        return WeatherCache.text || '';
+        if (WeatherCache.text) {
+          if (Date.now() - WeatherCache.at >= 10 * 60_000) fetchWeather();
+          return WeatherCache.text;
+        }
+        return fetchWeather();
       };
       const weather = await getWeather();
       if (gb !== -1) console.log(`[hud] gb=${gb} pb=${pb}`); // 诊断：手机上来的电量
@@ -796,7 +839,18 @@ const server = createServer(async (req, res) => {
 server.listen(port, host, () => {
   source.start();
   console.log(`[bridge] zcode-glasses listening on http://${host}:${port} (db: ${dbPath})`);
-  console.log('[bridge] endpoints: GET /health, GET /v1/state, POST /v1/chat/completions');
+  console.log('[bridge] endpoints: GET /health, GET /v1/state, GET /v1/hud, POST /v1/view, POST /v1/chat/completions');
+  console.log(`[bridge] tokens: full=${tokenFile}  display=${displayTokenFile} (fill the *display* one into the phone)`);
+
+  // 看板预取：lark-cli 每次要 fork 进程（约 1 秒），不能让手机的轮询等它。
+  // 每 60 秒在后台刷新待办/今日日程/天气/余额，/v1/hud 的请求路径只读内存。
+  const prefetchBoard = () => {
+    try { feishu.prefetchBoard(); } catch {}
+    if (WeatherCache.text && Date.now() - WeatherCache.at >= 10 * 60_000) fetchWeather().catch(() => {});
+    if (DsCache.text && Date.now() - DsCache.at >= 10 * 60_000) refreshDsBalance().catch(() => {});
+  };
+  setTimeout(prefetchBoard, 20_000).unref?.();
+  setInterval(prefetchBoard, 60_000).unref?.();
 
   // 会前提醒：每 5 分钟检查今日日程。T-30 推眼镜事件行（一次）；T-9~20 推飞书（一次）
   const reminded = new Set();

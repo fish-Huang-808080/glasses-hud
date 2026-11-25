@@ -117,11 +117,17 @@ git clone <this-repo> glasses-hud && cd glasses-hud
 node bridge/bridge.mjs            # 默认 127.0.0.1:8790
 ```
 
-首次运行会生成 `.state/bridge.token`。自测：
+首次运行会生成两把 token（见 [SECURITY.md](SECURITY.md)）：
+
+| Token | 文件 | 用途 |
+|---|---|---|
+| **display** | `.state/display.token` | **填到手机 App 里**。只能看看板、切视图、开关看板 |
+| **full** | `.state/bridge.token` | 本机自用。语音问答（能建/完结飞书待办）、完整会话快照 |
+
+自测：
 
 ```bash
-TOKEN=$(cat .state/bridge.token)
-curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/v1/hud
+curl -s -H "Authorization: Bearer $(cat .state/display.token)" http://127.0.0.1:8790/v1/hud
 ```
 
 把 `--host 0.0.0.0` 打开可让局域网访问；跨网访问建议用私有 overlay 网络
@@ -132,8 +138,9 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/v1/hud
 - **气温**：默认用 `wttr.in`（按出口 IP 定位），10 分钟缓存并落盘。
 - **DS 余额**：从 `~/.zcode/v2/provider_config.json` 读取 DeepSeek key，调用
   `GET /user/balance`，10 分钟缓存。
-- **飞书待办数**：通过 `lark-cli`（用户身份）读取“我负责的未完成”总数。
-  需要本机已安装并登录 `lark-cli`；未安装时该位置留空。
+- **飞书待办数 / 今日日程**：通过 `lark-cli`（用户身份）读取。需要本机已安装并
+  登录 `lark-cli`；未安装时该位置留空。`lark-cli` 每次调用要起一个进程（约 1 秒），
+  所以这些数据在**后台每分钟刷新**，`/v1/hud` 的请求路径只读内存（约 2ms）。
 - **LLM 兜底**：`llm.example.json` → `.state/llm.json`，规则答不上的问题转给
   大模型；`apiKey` 支持 `from-zcode:<providerId>` 引用，无需复制密钥。
 
@@ -147,8 +154,13 @@ curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8790/v1/hud
    [`hud-module/PATCHES.md`](hud-module/PATCHES.md) 逐处改宿主文件后重新打包。
 3. App 的 ⚡LLM 面板里填自定义模型：
    - 地址：`https://<你的主机>/v1`（协议选 **Chat /chat/completions**）
-   - Key：`.state/bridge.token`
+   - Key：`.state/display.token`（只读 token，泄露了也只能看看板）
    - 模型名：任意
+
+> **display token 不能用语音问答。** App 的 Key 栏只有一个，填 display 后，
+> “跟随电脑”这类语音口令会被 bridge 拒绝（`403`）。两个选择：
+> - 用通知栏按钮 / 镜腿滚轮开关看板，不用语音（推荐，也更安全）；
+> - 确实要语音时改填 `bridge.token`，但那样手机就拿到了建待办的权限。
 4. 对眼镜说“**跟随电脑**”，或点通知栏的「ZCode 看板」启动看板；
    按镜腿退出即关闭。
 

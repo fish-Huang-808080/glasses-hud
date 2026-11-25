@@ -2,8 +2,14 @@
 // 所有命令参数均由程序生成（ISO 日期），无用户输入注入面。
 import { exec } from 'node:child_process';
 
+// 过期后返回策略（lark-cli 每次要 fork 进程，约 1 秒；不能让 /v1/hud 的请求路径等它）：
+//   fresh   —— TTL 内，直接返回
+//   stale   —— 过期但未超过 STALE_MAX：立刻返回旧值，同时后台刷新（不阻塞请求）
+//   absent  —— 太旧或从未成功：仍会等待一次（仅冷启动）
 const TTL_MS = 90 * 1000;
+const STALE_MAX_MS = 30 * 60 * 1000;
 const cache = new Map(); // key -> { at, value }
+const inflight = new Map(); // key -> Promise，合并并发的同一请求
 
 function runLark(args) {
   return new Promise((resolve) => {
@@ -18,13 +24,35 @@ function runLark(args) {
   });
 }
 
+function refresh(key, fetcher) {
+  let p = inflight.get(key);
+  if (!p) {
+    p = (async () => {
+      try {
+        const value = await fetcher();
+        if (value) cache.set(key, { at: Date.now(), value }); // 失败不更新时间戳，下次重试
+        return value;
+      } catch { return null; }
+      finally { inflight.delete(key); }
+    })();
+    inflight.set(key, p);
+  }
+  return p;
+}
+
 async function cached(key, fetcher) {
   const hit = cache.get(key);
-  if (hit && Date.now() - hit.at < TTL_MS) return hit.value;
-  const value = await fetcher();
-  if (value) cache.set(key, { at: Date.now(), value }); // 失败不缓存，下次重试
-  return value;
+  const age = hit ? Date.now() - hit.at : Infinity;
+  if (age < TTL_MS) return hit.value;
+  if (hit && age < STALE_MAX_MS) {
+    refresh(key, fetcher); // 后台刷新，不等待
+    return hit.value;
+  }
+  return refresh(key, fetcher); // 冷启动：等这一次
 }
+
+/** 后台预取（不阻塞）：给定时器用，让热路径始终命中缓存。 */
+function prefetch(key, fetcher) { return refresh(key, fetcher); }
 
 const dayStr = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 const hhmm = (iso) => { const m = String(iso || '').match(/T(\d{2}:\d{2})/); return m ? m[1] : ''; };
@@ -121,6 +149,14 @@ export const feishu = {
   async agendaTomorrow() { const d = new Date(Date.now() + 864e5); return agendaView(dayStr(d), dayStr(d), false); },
   async agendaWeek() { const d = new Date(); const e = new Date(Date.now() + 6 * 864e5); return agendaView(dayStr(d), dayStr(e), true); },
   async tasks() { return myTasks(); },
+  // 看板要用的三份数据，后台定时刷新；/v1/hud 请求路径上因此不再等 lark-cli
+  prefetchBoard() {
+    const d = new Date();
+    return Promise.all([
+      prefetch('tasks', () => runLark('task +get-my-tasks --complete=false --page-all')),
+      prefetch(`agenda:${dayStr(d)}:${dayStr(d)}`, () => runLark(`calendar +agenda --start ${dayStr(d)}T00:00:00 --end ${dayStr(d)}T23:59:59`)),
+    ]);
+  },
   // 妙记检索：关键词（空=近30天）→ [{title, token}]
   async searchMinutes(kw) {
     const d = new Date(); const since = new Date(Date.now() - 30 * 864e5);

@@ -7,3 +7,12 @@
 tools/cloudflared.exe
 
 node_modules/
+
+# 个人数据：lark-cli minutes +detail 会把逐字稿写到当前目录的 minutes/
+# 知识库的原始记录与索引同样只留本机。这些目录里有同事、家人的真实对话。
+minutes/
+knowledge/
+raw/
+notes/
+index/
+*.har
