@@ -193,6 +193,19 @@ curl -s -H "Authorization: Bearer $(cat .state/display.token)" http://127.0.0.1:
   `register-task.ps1` 注册登录自启计划任务。
 - 其他平台：用 systemd / launchd / supervisor 托管 `node bridge/bridge.mjs`。
 
+## 归档（飞书 → 本机）
+
+[`archive/`](archive/README.md) 把飞书的妙记逐字稿、日程、待办原样落到本机一个
+**只增不改**的原始层，供以后做个人知识库用。它只负责“东西别丢”，不做总结和
+结构化。只读飞书，不写任何东西。
+
+```bash
+node archive/feishu-archive.mjs --dry-run    # 先看会存多少
+powershell -ExecutionPolicy Bypass -File register-archive-task.ps1   # 每 6 小时自动跑
+```
+
+数据存在仓库**外面**（`../glasses-hud-data/`），里面有真实的会议内容。
+
 ## 隐私与边界
 
 - bridge **只读** ZCode 数据库，不写入、不控制会话。

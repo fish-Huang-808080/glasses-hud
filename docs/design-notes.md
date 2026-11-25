@@ -180,9 +180,11 @@
   路径里，缓存失效那一次轮询就会卡 1 秒以上——表现为“隔很久第一次切看板很慢”，
   很容易误判成蓝牙握手慢。现在这些数据由后台每分钟预取，请求路径只读内存，
   实测 `/v1/hud` 从约 1000ms 降到约 2ms。天气和余额同理（过期先返回旧值、后台刷新）。
-- **`lark-cli minutes +detail` 不返回 JSON，而是把逐字稿写进当前目录的 `./minutes/`**，
-  且文件带说话人名和时间戳。在这个仓库目录里跑它之后 `git add -A`，会议原文就会
-  进公开仓库。`.gitignore` 已挡住 `minutes/`。
+- **`lark-cli minutes +detail` 会把带说话人名和时间戳的逐字稿写进 cwd 下的一个文件**，
+  并在返回 JSON 的 `data.minutes[0].artifacts.transcript_file` 里给出路径。
+  在这个仓库目录里跑它之后 `git add -A`，会议原文就会进公开仓库。
+  `.gitignore` 已挡住 `minutes/`。归档脚本在一个独立临时目录里运行它，见
+  [`archive/README.md`](../archive/README.md)。
 
 ## 两把 token
 
